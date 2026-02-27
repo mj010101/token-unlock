@@ -264,6 +264,16 @@ def build_pivot_table(unlock_events):
                 pre_day_return = (float(pre_row["close"]) / pre_open) - 1
                 days_from_end = i - len(pre_unlock_rows)
                 row[f"pre_return_{days_from_end}"] = round(pre_day_return, 6)
+
+                # compute BTC return for that one-day period
+                date_str_day = str(pre_row["date"])
+                btc_day = get_btc_range_return(date_str_day, date_str_day)
+                if btc_day is not None:
+                    excess_pre = round(pre_day_return - btc_day, 6)
+                else:
+                    excess_pre = None
+                row[f"excess_pre_return_{days_from_end}"] = excess_pre
+                row[f"bps_per_day_pre_{days_from_end}"] = round(excess_pre * 10000, 2) if excess_pre is not None else None
             
             # Calculate pre7 excess return (token return vs BTC return)
             pre_start_date_str = str(pre_unlock_rows.iloc[0]["date"])
@@ -274,6 +284,14 @@ def build_pivot_table(unlock_events):
                 row["pre7_excess_return"] = round(row["pre7_return"] - btc_pre7_return, 6)
             else:
                 row["pre7_excess_return"] = None
+            # pre7 new metrics
+            pre7_excess = row.get("pre7_excess_return")
+            if pre7_excess is not None:
+                row["pre7_bps_per_day"] = round((pre7_excess / 7) * 10000, 2)
+                row["pre7_annualized"]  = round((pre7_excess / 7) * 365, 6)
+            else:
+                row["pre7_bps_per_day"] = None
+                row["pre7_annualized"]  = None
         else:
             row["pre7_return"] = None
             row["pre7_excess_return"] = None
@@ -297,6 +315,14 @@ def build_pivot_table(unlock_events):
             row[f"return_{day}"]        = round(token_return, 6) if token_return is not None else None
             row[f"btc_return_{day}"]    = round(btc_return,   6) if btc_return   is not None else None
             row[f"excess_return_{day}"] = round(excess,        6) if excess       is not None else None
+
+            # new metrics
+            if excess is not None:
+                row[f"bps_per_day_{day}"] = round((excess / (day + 1)) * 10000, 2)
+                row[f"annualized_{day}"]  = round((excess / (day + 1)) * 365, 6)
+            else:
+                row[f"bps_per_day_{day}"] = None
+                row[f"annualized_{day}"]  = None
 
         results.append(row)
         time.sleep(0.3)
@@ -358,10 +384,33 @@ def print_analysis(df: pd.DataFrame):
     
     pre7_avg = df["pre7_excess_return"].mean()
     post7_avg = df["excess_return_7"].mean()
+    pre7_bps = df.get("pre7_bps_per_day").mean()
+    pre7_ann = df.get("pre7_annualized").mean()
+    post7_bps = df.get("bps_per_day_7").mean()
+    post7_ann = df.get("annualized_7").mean()
     
-    print(f"  Day -7 to -1 (pre-unlock):   {pre7_avg*100:+.2f}%  (excess vs BTC)")
-    print(f"  Day  0 to +7 (post-unlock):  {post7_avg*100:+.2f}%  (excess vs BTC)")
-    
+    print(f"  Day -7 to -1 (pre-unlock):   {pre7_avg*100:+.2f}%  "
+          f"({pre7_bps:+.1f} bps/d, {pre7_ann*100:+.2f}% ann)")
+    print(f"  Day  0 to +7 (post-unlock):  {post7_avg*100:+.2f}%  "
+          f"({post7_bps:+.1f} bps/d, {post7_ann*100:+.2f}% ann)")
+
+    # detailed daily profile
+    print("\n[1.5] Daily excess return profile (bps/day)")
+    print("-" * 55)
+    for d in range(-7, 8):
+        if d < 0:
+            col = f"bps_per_day_pre_{d}"
+        else:
+            col = f"bps_per_day_{d}"
+        avg = df[col].mean()
+        # insert unlock separator after -1
+        if d == -1:
+            print("  -------- unlock --------")
+        print(f"  Day {d:>3}: {avg:+.1f}")
+    # cumulative recap
+    print(f"\n  Day -7 to -1 cumulative: {pre7_avg*100:+.2f}% ({pre7_bps:+.1f} bps/d)")
+    print(f"  Day  0 to +7 cumulative: {post7_avg*100:+.2f}% ({post7_bps:+.1f} bps/d)")
+
     print(f"\n  By category:")
     print(f"    {'':20} {'Pre-7 (vs BTC)':>15} {'Post-7 (vs BTC)':>15}")
     for cat in ["VC", "OTC"]:
@@ -380,11 +429,20 @@ def print_analysis(df: pd.DataFrame):
 
     for day in [0, 1, 3, 7]:
         col = f"excess_return_{day}"
+        bps_col = f"bps_per_day_{day}"
+        ann_col = f"annualized_{day}"
         print(f"\n  Day {day:>2}:")
-        result = df.groupby("size_bucket", observed=True)[col].agg(["mean", "count"])
+        groups = df.groupby("size_bucket", observed=True)
+        result = groups[col].agg(["mean", "count"])
+        bps_means = groups[bps_col].mean()
+        ann_means = groups[ann_col].mean()
         for bucket, r in result.iterrows():
             direction = "DOWN" if r["mean"] < 0 else "UP  "
-            print(f"    [{direction}] {bucket}: {r['mean']*100:+.1f}%  (n={int(r['count'])})")
+            bps_mean = bps_means.loc[bucket]
+            ann_mean = ann_means.loc[bucket]
+            print(f"    [{direction}] {bucket}: {r['mean']*100:+.1f}%  "
+                  f"({bps_mean:+.1f} bps/d, {ann_mean*100:+.1f}% ann) "
+                  f"(n={int(r['count'])})")
 
     # 3. VC vs OTC comparison
     print("\n\n[3] VC vs OTC Average Excess Return")
@@ -392,20 +450,37 @@ def print_analysis(df: pd.DataFrame):
     print(f"  {'Day':<6} {'VC':>10} {'OTC':>10}")
     for day in [0, 1, 3, 7]:
         col     = f"excess_return_{day}"
+        bps_col = f"bps_per_day_{day}"
+        ann_col = f"annualized_{day}"
         vc_avg  = df[df["category"] == "VC"][col].mean()
         otc_avg = df[df["category"] == "OTC"][col].mean()
+        vc_bps  = df[df["category"] == "VC"][bps_col].mean()
+        otc_bps = df[df["category"] == "OTC"][bps_col].mean()
+        vc_ann  = df[df["category"] == "VC"][ann_col].mean()
+        otc_ann = df[df["category"] == "OTC"][ann_col].mean()
         print(f"  Day {day:<2}   {vc_avg*100:>+9.1f}%  {otc_avg*100:>+9.1f}%")
+        print(f"            (VC: {vc_bps:+.1f} bps/d, {vc_ann*100:+.1f}% ann) "
+              f"(OTC: {otc_bps:+.1f} bps/d, {otc_ann*100:+.1f}% ann)")
 
     # 4. Individual event summary sorted by Day1 excess return
     print("\n\n[4] Individual Events (sorted by Day1 Excess Return)")
     print("-" * 75)
     cols    = ["symbol", "unlock_date", "category", "unlock_pct_supply",
-               "excess_return_0", "excess_return_1", "excess_return_7"]
+               "excess_return_0", "bps_per_day_0", "annualized_0",
+               "excess_return_1", "bps_per_day_1", "annualized_1",
+               "excess_return_7", "bps_per_day_7", "annualized_7"]
     summary = df[cols].copy()
-    summary.columns = ["Symbol", "Date", "Type", "Unlock%", "Day0", "Day1", "Day7"]
+    summary.columns = ["Symbol", "Date", "Type", "Unlock%",
+                       "Day0", "Day0 bps/d", "Day0 ann%",
+                       "Day1", "Day1 bps/d", "Day1 ann%",
+                       "Day7", "Day7 bps/d", "Day7 ann%"]
     # Sort by Day1 BEFORE converting to strings
     summary = summary.sort_values("Day1")
     for col in ["Day0", "Day1", "Day7"]:
+        summary[col] = summary[col].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
+    for col in ["Day0 bps/d", "Day1 bps/d", "Day7 bps/d"]:
+        summary[col] = summary[col].apply(lambda x: f"{x:+.1f}" if pd.notna(x) else "N/A")
+    for col in ["Day0 ann%", "Day1 ann%", "Day7 ann%"]:
         summary[col] = summary[col].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
     print(summary.to_string(index=False))
 
@@ -414,12 +489,13 @@ def print_analysis(df: pd.DataFrame):
     print("-" * 55)
     col      = "excess_return_1"
     outliers = df[df[col].abs() > 0.10][
-        ["symbol", "unlock_date", "category", "unlock_pct_supply", col]
+        ["symbol", "unlock_date", "category", "unlock_pct_supply", col, "bps_per_day_1", "annualized_1"]
     ].sort_values(col)
     for _, r in outliers.iterrows():
         direction = "SURGE" if r[col] > 0 else "DUMP "
         print(f"  [{direction}] {r['symbol']} {r['unlock_date']}: "
               f"Day1 Excess={r[col]*100:+.1f}%  "
+              f"({r['bps_per_day_1']:+.1f} bps/d, {r['annualized_1']*100:+.1f}% ann) "
               f"(unlock={r['unlock_pct_supply']}%, {r['category']})")
 
     # 6. Overall summary
@@ -427,8 +503,13 @@ def print_analysis(df: pd.DataFrame):
     print("-" * 40)
     for day in [0, 1, 3, 7]:
         col = f"excess_return_{day}"
+        bps_col = f"bps_per_day_{day}"
+        ann_col = f"annualized_{day}"
         avg = df[col].mean()
-        print(f"  Day {day:>2}: {avg*100:+.2f}%")
+        bps_avg = df[bps_col].mean()
+        ann_avg = df[ann_col].mean()
+        print(f"  Day {day:>2}: {avg*100:+.2f}%  "
+              f"({bps_avg:+.1f} bps/d, {ann_avg*100:+.2f}% ann)")
 
 
 # ============================================================
