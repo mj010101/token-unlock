@@ -71,7 +71,7 @@ UNLOCK_EVENTS = [
 # STEP 2: PRICE DATA FROM BINANCE
 # ============================================================
 
-def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 8, days_after: int = 15):
+def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 8, days_after: int = 8):
 
     """Fetch OHLCV data around unlock date from Binance."""
     binance_symbol = f"{symbol}USDT"
@@ -89,7 +89,7 @@ def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 8, days_aft
         "interval":  "1d",
         "startTime": start_ms,
         "endTime":   end_ms,
-        "limit":     20,
+        "limit":     30,
     }
 
     try:
@@ -162,14 +162,18 @@ def get_btc_return(date_str: str, day_offset: int) -> float:
 
 def build_pivot_table(unlock_events):
     results = []
+    price_cache = {}  # Cache to store price_df for each (symbol, date_str)
 
     for symbol, date_str, unlock_amount, total_supply, category in unlock_events:
         print(f"Processing {symbol} {date_str}...")
 
-        price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=15)
+        price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=8)
         if price_df is None or len(price_df) < 2:
             print(f"  [SKIP] {symbol} {date_str} - insufficient price data")
             continue
+        
+        # Cache the price data for later raw export
+        price_cache[(symbol, date_str)] = price_df
 
         # Calculate average daily USD volume for liquidity filter
         avg_daily_volume_usd = price_df["quote_volume"].mean()
@@ -219,12 +223,23 @@ def build_pivot_table(unlock_events):
                 pre_day_return = (float(pre_row["close"]) / pre_open) - 1
                 days_from_end = i - len(pre_unlock_rows)
                 row[f"pre_return_{days_from_end}"] = round(pre_day_return, 6)
+            
+            # Calculate pre7 excess return (token return vs BTC return)
+            pre_start_date_str = str(pre_unlock_rows.iloc[0]["date"])
+            pre_end_date_str = str(pre_unlock_rows.iloc[-1]["date"])
+            btc_pre7_return = get_btc_range_return(pre_start_date_str, pre_end_date_str)
+            
+            if btc_pre7_return is not None:
+                row["pre7_excess_return"] = round(row["pre7_return"] - btc_pre7_return, 6)
+            else:
+                row["pre7_excess_return"] = None
         else:
             row["pre7_return"] = None
+            row["pre7_excess_return"] = None
             for d in range(-7, 0):
                 row[f"pre_return_{d}"] = None
 
-        for day in range(15):
+        for day in range(8):
             target_dt = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=day)).date()
             day_data  = price_df[price_df["date"] == target_dt]
 
@@ -245,12 +260,50 @@ def build_pivot_table(unlock_events):
         results.append(row)
         time.sleep(0.3)
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), price_cache
 
 
 # ============================================================
 # STEP 4: ANALYSIS & OUTPUT
 # ============================================================
+
+def get_btc_range_return(start_date_str: str, end_date_str: str) -> float:
+    """Fetch BTC return for a date range (start_date open to end_date close)."""
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+    
+    start_ms = int((start_date - timedelta(days=1)).timestamp() * 1000)
+    end_ms = int((end_date + timedelta(days=1)).timestamp() * 1000)
+    
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": "BTCUSDT",
+        "interval": "1d",
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": 30,
+    }
+    
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if len(data) < 2:
+            return None
+        
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close",
+            "volume", "close_time", "quote_vol", "trades",
+            "tbbase", "tbquote", "ignore"
+        ])
+        df["open"] = df["open"].astype(float)
+        df["close"] = df["close"].astype(float)
+        
+        open0 = df.iloc[0]["open"]
+        close_end = df.iloc[-1]["close"]
+        return (close_end / open0) - 1
+    except Exception:
+        return None
+
 
 def print_analysis(df: pd.DataFrame):
     print("\n" + "=" * 60)
@@ -258,14 +311,33 @@ def print_analysis(df: pd.DataFrame):
     print("=" * 60)
     print("\nNote: All post-unlock returns are cumulative from Day 0 open. Day N = close_N / open_0 - 1.")
 
-    # 1. Average excess return by unlock size bucket
-    print("\n[1] Average Excess Return by Unlock Size (% of supply)")
+    # 1. Day -7 vs Day +7 (PRIMARY ANALYSIS)
+    print("\n[1] Day -7 to -1 (Pre-Unlock) vs Day 0 to +7 (Post-Unlock)")
+    print("-" * 55)
+    
+    pre7_avg = df["pre7_excess_return"].mean()
+    post7_avg = df["excess_return_7"].mean()
+    
+    print(f"  Day -7 to -1 (pre-unlock):   {pre7_avg*100:+.2f}%  (excess vs BTC)")
+    print(f"  Day  0 to +7 (post-unlock):  {post7_avg*100:+.2f}%  (excess vs BTC)")
+    
+    print(f"\n  By category:")
+    print(f"    {'':20} {'Pre-7 (vs BTC)':>15} {'Post-7 (vs BTC)':>15}")
+    for cat in ["VC", "OTC"]:
+        cat_df = df[df["category"] == cat]
+        if len(cat_df) > 0:
+            pre7_cat = cat_df["pre7_excess_return"].mean()
+            post7_cat = cat_df["excess_return_7"].mean()
+            print(f"    {cat:20} {pre7_cat*100:>+14.2f}%  {post7_cat*100:>+14.2f}%")
+
+    # 2. Average excess return by unlock size bucket
+    print("\n\n[2] Average Excess Return by Unlock Size (% of supply)")
     print("-" * 55)
     bins   = [0, 1, 5, 10, 100]
     labels = ["Small  <1%", "Mid  1-5%", "Large 5-10%", "XL   >10%"]
     df["size_bucket"] = pd.cut(df["unlock_pct_supply"], bins=bins, labels=labels)
 
-    for day in [0, 1, 3, 7, 14]:
+    for day in [0, 1, 3, 7]:
         col = f"excess_return_{day}"
         print(f"\n  Day {day:>2}:")
         result = df.groupby("size_bucket", observed=True)[col].agg(["mean", "count"])
@@ -273,30 +345,31 @@ def print_analysis(df: pd.DataFrame):
             direction = "DOWN" if r["mean"] < 0 else "UP  "
             print(f"    [{direction}] {bucket}: {r['mean']*100:+.1f}%  (n={int(r['count'])})")
 
-    # 2. VC vs OTC comparison
-    print("\n\n[2] VC vs OTC Average Excess Return")
+    # 3. VC vs OTC comparison
+    print("\n\n[3] VC vs OTC Average Excess Return")
     print("-" * 40)
     print(f"  {'Day':<6} {'VC':>10} {'OTC':>10}")
-    for day in [0, 1, 3, 7, 14]:
+    for day in [0, 1, 3, 7]:
         col     = f"excess_return_{day}"
         vc_avg  = df[df["category"] == "VC"][col].mean()
         otc_avg = df[df["category"] == "OTC"][col].mean()
         print(f"  Day {day:<2}   {vc_avg*100:>+9.1f}%  {otc_avg*100:>+9.1f}%")
 
-    # 3. Individual event summary sorted by Day1 excess return
-    print("\n\n[3] Individual Events (sorted by Day1 Excess Return)")
+    # 4. Individual event summary sorted by Day1 excess return
+    print("\n\n[4] Individual Events (sorted by Day1 Excess Return)")
     print("-" * 75)
     cols    = ["symbol", "unlock_date", "category", "unlock_pct_supply",
-               "excess_return_0", "excess_return_1", "excess_return_7", "excess_return_14"]
+               "excess_return_0", "excess_return_1", "excess_return_7"]
     summary = df[cols].copy()
-    summary.columns = ["Symbol", "Date", "Type", "Unlock%", "Day0", "Day1", "Day7", "Day14"]
-    for col in ["Day0", "Day1", "Day7", "Day14"]:
-        summary[col] = summary[col].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
+    summary.columns = ["Symbol", "Date", "Type", "Unlock%", "Day0", "Day1", "Day7"]
+    # Sort by Day1 BEFORE converting to strings
     summary = summary.sort_values("Day1")
+    for col in ["Day0", "Day1", "Day7"]:
+        summary[col] = summary[col].apply(lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "N/A")
     print(summary.to_string(index=False))
 
-    # 4. Notable outliers
-    print("\n\n[4] Notable Outliers (|Day1 Excess| > 10%)")
+    # 5. Notable outliers
+    print("\n\n[5] Notable Outliers (|Day1 Excess| > 10%)")
     print("-" * 55)
     col      = "excess_return_1"
     outliers = df[df[col].abs() > 0.10][
@@ -308,34 +381,13 @@ def print_analysis(df: pd.DataFrame):
               f"Day1 Excess={r[col]*100:+.1f}%  "
               f"(unlock={r['unlock_pct_supply']}%, {r['category']})")
 
-    # 5. Overall summary
-    print("\n\n[5] Overall Average Excess Return (all events)")
+    # 6. Overall summary
+    print("\n\n[6] Overall Average Excess Return (all events)")
     print("-" * 40)
-    for day in [0, 1, 3, 7, 14]:
+    for day in [0, 1, 3, 7]:
         col = f"excess_return_{day}"
         avg = df[col].mean()
         print(f"  Day {day:>2}: {avg*100:+.2f}%")
-
-    # 6. Day -7 vs Day +7 analysis
-    print("\n\n[6] Pre-Unlock vs Post-Unlock Performance (Day -7 to +7)")
-    print("-" * 55)
-    
-    pre7_avg = df["pre7_return"].mean()
-    post7_avg = df["excess_return_7"].mean()
-    delta = post7_avg - pre7_avg
-    
-    print(f"  Average Pre7 Return (Day -7 to -1):  {pre7_avg*100:+.2f}%")
-    print(f"  Average Day 7 Excess Return:         {post7_avg*100:+.2f}%")
-    print(f"  Delta (Post - Pre):                  {delta*100:+.2f}%")
-    
-    print(f"\n  By Category:")
-    print(f"    {'':25} {'Pre7 Return':>15} {'Day7 Excess':>15}")
-    for cat in ["VC", "OTC"]:
-        cat_df = df[df["category"] == cat]
-        if len(cat_df) > 0:
-            pre7_cat = cat_df["pre7_return"].mean()
-            post7_cat = cat_df["excess_return_7"].mean()
-            print(f"    {cat:25} {pre7_cat*100:>+14.2f}%  {post7_cat*100:>+14.2f}%")
 
 
 # ============================================================
@@ -345,7 +397,7 @@ def print_analysis(df: pd.DataFrame):
 if __name__ == "__main__":
     print("Token Unlock Alpha Framework starting...\n")
 
-    df = build_pivot_table(UNLOCK_EVENTS)
+    df, price_cache = build_pivot_table(UNLOCK_EVENTS)
 
     os.makedirs("Jeff", exist_ok=True)
     df.to_csv("Jeff/unlock_alpha.csv", index=False)
@@ -353,15 +405,15 @@ if __name__ == "__main__":
 
     print_analysis(df)
 
-    # Export raw price data for all events
+    # Export raw price data for all events (using cached data)
     print("\n\nExporting raw price data...")
     raw_prices = []
     
     for symbol, date_str, unlock_amount, total_supply, category in UNLOCK_EVENTS:
-        price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=15)
-        if price_df is None or len(price_df) < 2:
+        if (symbol, date_str) not in price_cache:
             continue
         
+        price_df = price_cache[(symbol, date_str)]
         unlock_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
         
         # Find the unlock day index
@@ -374,22 +426,25 @@ if __name__ == "__main__":
         if unlock_day_idx is None:
             unlock_day_idx = 0
         
-        # Tag each row with unlock info and day offset
+        # Get unlock_pct_supply from the dataframe
+        unlock_pct = round(unlock_amount / total_supply * 100, 4)
+        
+        # Tag each row with unlock info and day offset, filter to -7 to +7
         for idx, (_, row) in enumerate(price_df.iterrows()):
             day_offset = idx - unlock_day_idx
-            raw_prices.append({
-                "symbol": symbol,
-                "unlock_date": date_str,
-                "category": category,
-                "day_offset": day_offset,
-                "date": row["date"],
-                "open": row["open"],
-                "close": row["close"],
-                "volume": row["volume"],
-                "quote_volume": row["quote_volume"],
-            })
-        
-        time.sleep(0.3)
+            if -7 <= day_offset <= 7:  # Only keep data in range
+                raw_prices.append({
+                    "symbol": symbol,
+                    "unlock_date": date_str,
+                    "category": category,
+                    "unlock_pct_supply": unlock_pct,
+                    "day_offset": day_offset,
+                    "date": row["date"],
+                    "open": row["open"],
+                    "close": row["close"],
+                    "volume": row["volume"],
+                    "quote_volume": row["quote_volume"],
+                })
     
     if raw_prices:
         raw_df = pd.DataFrame(raw_prices)
