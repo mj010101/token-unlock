@@ -5,62 +5,73 @@ import time
 import os
 
 # ============================================================
+# COINGECKO MAPPINGS
+# Free API for historical circulating supply data
+# ============================================================
+
+# Hardcoded circulating supply snapshots (as of unlock date)
+# Source: CoinGecko/CMC historical data
+# ZK, ENA, EIGEN are estimates pending actual unlock dates
+
+CIRCULATING_SUPPLY_SNAPSHOT = {
+    ("ARB",   "2024-03-16"): 3_275_000_000,
+    ("OP",    "2024-01-31"):   893_000_000,
+    ("APT",   "2024-01-12"):   374_000_000,
+    ("SUI",   "2024-05-03"):   928_000_000,
+    ("PYTH",  "2024-05-20"): 3_550_000_000,
+    ("STRK",  "2024-06-15"):   728_000_000,
+    ("JUP",   "2025-01-31"): 1_350_000_000,
+    ("ZK",    "2025-06-17"): 5_600_000_000,
+    ("ENA",   "2025-04-05"): 3_500_000_000,
+    ("EIGEN", "2025-09-30"):   400_000_000,
+    ("IMX",   "2024-01-24"):   975_000_000,
+    ("AVAX",  "2024-01-01"):   391_000_000,
+    ("SEI",   "2024-08-15"): 2_590_000_000,
+    ("TIA",   "2024-10-30"):   192_000_000,
+    ("ALT",   "2024-03-25"):   851_000_000,
+    ("WLD",   "2024-03-24"):   154_000_000,
+    ("DYDX",  "2024-02-03"):   170_000_000,
+    ("BLUR",  "2024-02-14"):   560_000_000,
+    ("UNI",   "2024-04-17"):   601_000_000,
+    ("RNDR",  "2024-04-01"):   379_000_000,
+    ("AXS",   "2024-01-22"):    60_000_000,
+    ("APE",   "2023-03-17"):   289_000_000,
+    ("LDO",   "2023-05-25"):   878_000_000,
+    ("MAGIC", "2023-02-25"):   213_000_000,
+    ("GMT",   "2023-03-09"):   600_000_000,
+}
+
+# ============================================================
 # STEP 1: UNLOCK EVENT DATA
 # Add OTC deal terms from Jeff's network here
 # ============================================================
 
 UNLOCK_EVENTS = [
     # (symbol, unlock_date, unlock_amount_tokens, total_supply, category)
-
-    # --- Original 18 events ---
+    # Only the first unlock per token is included
+    
     ("ARB",   "2024-03-16", 1_110_000_000, 10_000_000_000, "VC"),
-    ("ARB",   "2024-04-16",    92_500_000, 10_000_000_000, "VC"),
-    ("ARB",   "2024-05-16",    92_500_000, 10_000_000_000, "VC"),
-    ("ARB",   "2024-06-16",    92_500_000, 10_000_000_000, "VC"),
     ("OP",    "2024-01-31",    24_160_000,  4_294_967_296, "VC"),
-    ("OP",    "2024-02-29",    24_160_000,  4_294_967_296, "VC"),
-    ("OP",    "2024-05-31",    24_160_000,  4_294_967_296, "VC"),
     ("APT",   "2024-01-12",     2_830_000,  1_000_000_000, "VC"),
-    ("APT",   "2024-04-12",     2_830_000,  1_000_000_000, "VC"),
     ("SUI",   "2024-05-03",    64_363_000, 10_000_000_000, "VC"),
-    ("SUI",   "2024-06-03",    64_363_000, 10_000_000_000, "VC"),
-    ("SUI",   "2024-07-03",    64_363_000, 10_000_000_000, "VC"),
     ("PYTH",  "2024-05-20", 2_500_000_000, 10_000_000_000, "OTC"),
     ("STRK",  "2024-06-15",    64_000_000, 10_000_000_000, "VC"),
     ("JUP",   "2025-01-31", 1_000_000_000, 10_000_000_000, "VC"),
     ("ZK",    "2025-06-17", 3_675_000_000, 21_000_000_000, "VC"),
     ("ENA",   "2025-04-05",   180_000_000, 15_000_000_000, "OTC"),
     ("EIGEN", "2025-09-30",    86_000_000,  1_674_203_671, "VC"),
-
-    # --- Expanded dataset ---
-
-    # Layer 1 / Layer 2
     ("IMX",   "2024-01-24",    36_332_000,  2_000_000_000, "VC"),
-    ("IMX",   "2024-07-24",    36_332_000,  2_000_000_000, "VC"),
     ("AVAX",  "2024-01-01",     9_500_000,    720_000_000, "VC"),
     ("SEI",   "2024-08-15",   900_000_000, 10_000_000_000, "VC"),
     ("TIA",   "2024-10-30",   175_586_000,  1_000_000_000, "VC"),
     ("ALT",   "2024-03-25",   518_400_000, 10_000_000_000, "VC"),
-
-    # DeFi
     ("WLD",   "2024-03-24",   101_695_000, 10_000_000_000, "OTC"),
-    ("WLD",   "2024-07-24",   101_695_000, 10_000_000_000, "OTC"),
     ("DYDX",  "2024-02-03",   150_000_000,  1_000_000_000, "VC"),
-    ("DYDX",  "2024-06-01",   150_000_000,  1_000_000_000, "VC"),
     ("BLUR",  "2024-02-14",   300_000_000,  3_000_000_000, "VC"),
     ("UNI",   "2024-04-17",    43_000_000,  1_000_000_000, "VC"),
-
-    # AI / Gaming
     ("RNDR",  "2024-04-01",     5_000_000,    536_870_912, "VC"),
     ("AXS",   "2024-01-22",     6_000_000,    270_000_000, "VC"),
-
-    # 2023 data (3-year lookback)
-    ("ARB",   "2023-09-16", 1_110_000_000, 10_000_000_000, "VC"),
-    ("OP",    "2023-05-31",    24_160_000,  4_294_967_296, "VC"),
-    ("OP",    "2023-06-30",    24_160_000,  4_294_967_296, "VC"),
-    ("OP",    "2023-07-31",    24_160_000,  4_294_967_296, "VC"),
     ("APE",   "2023-03-17",    15_607_000,  1_000_000_000, "VC"),
-    ("APE",   "2023-06-17",    15_607_000,  1_000_000_000, "VC"),
     ("LDO",   "2023-05-25",    22_965_000,  1_000_000_000, "VC"),
     ("MAGIC", "2023-02-25",    30_000_000,    350_000_000, "VC"),
     ("GMT",   "2023-03-09",   600_000_000,  6_000_000_000, "OTC"),
@@ -156,9 +167,23 @@ def get_btc_return(date_str: str, day_offset: int) -> float:
         return None
 
 
+def get_circulating_supply(symbol: str, date_str: str) -> float | None:
+    """
+    Fetch circulating supply from hardcoded snapshot.
+    Returns circulating supply as float, or None if unavailable.
+    """
+    supply = CIRCULATING_SUPPLY_SNAPSHOT.get((symbol, date_str))
+    if supply is None:
+        print(f"  [WARN] No snapshot entry for {symbol} {date_str}")
+        return None
+    return float(supply)
+
+
 # ============================================================
 # STEP 3: BUILD PIVOT TABLE
 # ============================================================
+
+BIG_UNLOCK_THRESHOLD = 1.0  # % of circulating supply
 
 def build_pivot_table(unlock_events):
     results = []
@@ -166,6 +191,20 @@ def build_pivot_table(unlock_events):
 
     for symbol, date_str, unlock_amount, total_supply, category in unlock_events:
         print(f"Processing {symbol} {date_str}...")
+
+        # Fetch historical circulating supply from snapshot
+        circulating_supply = get_circulating_supply(symbol, date_str)
+
+        if circulating_supply is None or circulating_supply == 0:
+            print(f"  [SKIP] {symbol} {date_str} - could not fetch circulating supply")
+            continue
+
+        unlock_pct_circulating = round(unlock_amount / circulating_supply * 100, 4)
+
+        # Filter by big unlock threshold (>= 5% of circulating supply)
+        if unlock_pct_circulating < BIG_UNLOCK_THRESHOLD:
+            print(f"  [SKIP] {symbol} - small unlock ({unlock_pct_circulating:.2f}% of circulating)")
+            continue
 
         price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=8)
         if price_df is None or len(price_df) < 2:
@@ -196,7 +235,9 @@ def build_pivot_table(unlock_events):
             "category":          category,
             "unlock_amount":     unlock_amount,
             "total_supply":      total_supply,
+            "circulating_supply": circulating_supply,
             "unlock_pct_supply": round(unlock_amount / total_supply * 100, 4),
+            "unlock_pct_circulating": unlock_pct_circulating,
             "open_price":        open0,
             "avg_daily_volume_usd": round(avg_daily_volume_usd, 0),
         }
@@ -331,11 +372,11 @@ def print_analysis(df: pd.DataFrame):
             print(f"    {cat:20} {pre7_cat*100:>+14.2f}%  {post7_cat*100:>+14.2f}%")
 
     # 2. Average excess return by unlock size bucket
-    print("\n\n[2] Average Excess Return by Unlock Size (% of supply)")
+    print("\n\n[2] Average Excess Return by Unlock Size (% of circulating supply)")
     print("-" * 55)
-    bins   = [0, 1, 5, 10, 100]
-    labels = ["Small  <1%", "Mid  1-5%", "Large 5-10%", "XL   >10%"]
-    df["size_bucket"] = pd.cut(df["unlock_pct_supply"], bins=bins, labels=labels)
+    bins   = [0, 5, 10, 20, 100]
+    labels = ["Small <5%", "Mid 5-10%", "Large 10-20%", "XL >20%"]
+    df["size_bucket"] = pd.cut(df["unlock_pct_circulating"], bins=bins, labels=labels)
 
     for day in [0, 1, 3, 7]:
         col = f"excess_return_{day}"
