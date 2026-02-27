@@ -53,7 +53,6 @@ UNLOCK_EVENTS = [
     # AI / Gaming
     ("RNDR",  "2024-04-01",     5_000_000,    536_870_912, "VC"),
     ("AXS",   "2024-01-22",     6_000_000,    270_000_000, "VC"),
-    ("RON",   "2024-01-27",    58_000_000,  1_000_000_000, "VC"),
 
     # 2023 data (3-year lookback)
     ("ARB",   "2023-09-16", 1_110_000_000, 10_000_000_000, "VC"),
@@ -72,7 +71,8 @@ UNLOCK_EVENTS = [
 # STEP 2: PRICE DATA FROM BINANCE
 # ============================================================
 
-def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 1, days_after: int = 15):
+def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 8, days_after: int = 15):
+
     """Fetch OHLCV data around unlock date from Binance."""
     binance_symbol = f"{symbol}USDT"
 
@@ -110,7 +110,9 @@ def get_binance_ohlcv(symbol: str, date_str: str, days_before: int = 1, days_aft
         df["date"]  = pd.to_datetime(df["open_time"], unit="ms").dt.date
         df["open"]  = df["open"].astype(float)
         df["close"] = df["close"].astype(float)
-        return df[["date", "open", "close"]]
+        df["volume"] = df["volume"].astype(float)
+        df["quote_volume"] = df["quote_volume"].astype(float)
+        return df[["date", "open", "close", "volume", "quote_volume"]]
 
     except Exception as e:
         print(f"  [ERROR] {symbol}: {e}")
@@ -164,9 +166,15 @@ def build_pivot_table(unlock_events):
     for symbol, date_str, unlock_amount, total_supply, category in unlock_events:
         print(f"Processing {symbol} {date_str}...")
 
-        price_df = get_binance_ohlcv(symbol, date_str)
+        price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=15)
         if price_df is None or len(price_df) < 2:
             print(f"  [SKIP] {symbol} {date_str} - insufficient price data")
+            continue
+
+        # Calculate average daily USD volume for liquidity filter
+        avg_daily_volume_usd = price_df["quote_volume"].mean()
+        if avg_daily_volume_usd < 1_000_000:
+            print(f"  [SKIP] {symbol} - low liquidity (avg ${avg_daily_volume_usd:,.0f}/day)")
             continue
 
         unlock_dt  = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -186,7 +194,35 @@ def build_pivot_table(unlock_events):
             "total_supply":      total_supply,
             "unlock_pct_supply": round(unlock_amount / total_supply * 100, 4),
             "open_price":        open0,
+            "avg_daily_volume_usd": round(avg_daily_volume_usd, 0),
         }
+
+        # Calculate pre-unlock returns (Day -7 to Day -1)
+        unlock_day_idx = None
+        for idx, row_date in enumerate(price_df["date"]):
+            if row_date == unlock_dt:
+                unlock_day_idx = idx
+                break
+        
+        if unlock_day_idx is None:
+            unlock_day_idx = 0
+        
+        pre_unlock_rows = price_df.iloc[max(0, unlock_day_idx - 7):unlock_day_idx]
+        
+        if len(pre_unlock_rows) >= 2:
+            pre_open = float(pre_unlock_rows.iloc[0]["open"])
+            pre_close = float(pre_unlock_rows.iloc[-1]["close"])
+            row["pre7_return"] = round((pre_close / pre_open) - 1, 6)
+            
+            # Calculate individual day returns for Day -7 to Day -1
+            for i, (pre_idx, pre_row) in enumerate(pre_unlock_rows.iterrows()):
+                pre_day_return = (float(pre_row["close"]) / pre_open) - 1
+                days_from_end = i - len(pre_unlock_rows)
+                row[f"pre_return_{days_from_end}"] = round(pre_day_return, 6)
+        else:
+            row["pre7_return"] = None
+            for d in range(-7, 0):
+                row[f"pre_return_{d}"] = None
 
         for day in range(15):
             target_dt = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=day)).date()
@@ -220,6 +256,7 @@ def print_analysis(df: pd.DataFrame):
     print("\n" + "=" * 60)
     print("TOKEN UNLOCK ALPHA ANALYSIS")
     print("=" * 60)
+    print("\nNote: All post-unlock returns are cumulative from Day 0 open. Day N = close_N / open_0 - 1.")
 
     # 1. Average excess return by unlock size bucket
     print("\n[1] Average Excess Return by Unlock Size (% of supply)")
@@ -279,6 +316,27 @@ def print_analysis(df: pd.DataFrame):
         avg = df[col].mean()
         print(f"  Day {day:>2}: {avg*100:+.2f}%")
 
+    # 6. Day -7 vs Day +7 analysis
+    print("\n\n[6] Pre-Unlock vs Post-Unlock Performance (Day -7 to +7)")
+    print("-" * 55)
+    
+    pre7_avg = df["pre7_return"].mean()
+    post7_avg = df["excess_return_7"].mean()
+    delta = post7_avg - pre7_avg
+    
+    print(f"  Average Pre7 Return (Day -7 to -1):  {pre7_avg*100:+.2f}%")
+    print(f"  Average Day 7 Excess Return:         {post7_avg*100:+.2f}%")
+    print(f"  Delta (Post - Pre):                  {delta*100:+.2f}%")
+    
+    print(f"\n  By Category:")
+    print(f"    {'':25} {'Pre7 Return':>15} {'Day7 Excess':>15}")
+    for cat in ["VC", "OTC"]:
+        cat_df = df[df["category"] == cat]
+        if len(cat_df) > 0:
+            pre7_cat = cat_df["pre7_return"].mean()
+            post7_cat = cat_df["excess_return_7"].mean()
+            print(f"    {cat:25} {pre7_cat*100:>+14.2f}%  {post7_cat*100:>+14.2f}%")
+
 
 # ============================================================
 # MAIN
@@ -294,5 +352,48 @@ if __name__ == "__main__":
     print("\nSaved: Jeff/unlock_alpha.csv")
 
     print_analysis(df)
+
+    # Export raw price data for all events
+    print("\n\nExporting raw price data...")
+    raw_prices = []
+    
+    for symbol, date_str, unlock_amount, total_supply, category in UNLOCK_EVENTS:
+        price_df = get_binance_ohlcv(symbol, date_str, days_before=8, days_after=15)
+        if price_df is None or len(price_df) < 2:
+            continue
+        
+        unlock_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+        
+        # Find the unlock day index
+        unlock_day_idx = None
+        for idx, row_date in enumerate(price_df["date"]):
+            if row_date == unlock_dt:
+                unlock_day_idx = idx
+                break
+        
+        if unlock_day_idx is None:
+            unlock_day_idx = 0
+        
+        # Tag each row with unlock info and day offset
+        for idx, (_, row) in enumerate(price_df.iterrows()):
+            day_offset = idx - unlock_day_idx
+            raw_prices.append({
+                "symbol": symbol,
+                "unlock_date": date_str,
+                "category": category,
+                "day_offset": day_offset,
+                "date": row["date"],
+                "open": row["open"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "quote_volume": row["quote_volume"],
+            })
+        
+        time.sleep(0.3)
+    
+    if raw_prices:
+        raw_df = pd.DataFrame(raw_prices)
+        raw_df.to_csv("Jeff/unlock_raw_prices.csv", index=False)
+        print("Saved: Jeff/unlock_raw_prices.csv")
 
     print("\nDone.")
