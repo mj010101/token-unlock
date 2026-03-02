@@ -179,6 +179,47 @@ def get_circulating_supply(symbol: str, date_str: str) -> float | None:
     return float(supply)
 
 
+def calculate_sharpe_sortino(returns_series, risk_free_rate_daily=0.02/365):
+    """
+    Calculate annualized Sharpe and Sortino ratios from a series of daily returns (crypto markets).
+    
+    Annualized Sharpe Ratio = (mean_excess_return / std_dev) * sqrt(365)
+    Annualized Sortino Ratio = (mean_excess_return / downside_deviation) * sqrt(365)
+    
+    Args:
+        returns_series: pd.Series of daily returns (as decimals, e.g., 0.01 = 1%)
+        risk_free_rate_daily: daily risk-free rate (default: 2% annual / 365 days for crypto 24/7)
+    
+    Returns:
+        (annualized_sharpe, annualized_sortino) as floats, or (None, None) if insufficient data
+    """
+    import math
+    returns = returns_series.dropna()
+    if len(returns) < 2:
+        return None, None
+    
+    excess_returns = returns - risk_free_rate_daily
+    mean_excess = excess_returns.mean()
+    
+    # Annualization factor for crypto (365 calendar days, 24/7 trading)
+    annualization_factor = math.sqrt(365)
+    
+    # Annualized Sharpe ratio
+    std_dev = returns.std()
+    sharpe = (mean_excess / std_dev) * annualization_factor if std_dev > 0 else None
+    
+    # Annualized Sortino ratio (downside deviation only)
+    downside_returns = returns[returns < risk_free_rate_daily] - risk_free_rate_daily
+    if len(downside_returns) > 0:
+        downside_std = downside_returns.std()
+    else:
+        downside_std = 0
+    
+    sortino = (mean_excess / downside_std) * annualization_factor if downside_std > 0 else None
+    
+    return sharpe, sortino
+
+
 # ============================================================
 # STEP 3: BUILD PIVOT TABLE
 # ============================================================
@@ -511,6 +552,117 @@ def print_analysis(df: pd.DataFrame):
         print(f"  Day {day:>2}: {avg*100:+.2f}%  "
               f"({bps_avg:+.1f} bps/d, {ann_avg*100:+.2f}% ann)")
 
+    # 7. Sharpe and Sortino Ratios
+    print("\n\n[7] Risk-Adjusted Returns: Annualized Sharpe & Sortino Ratios")
+    print("-" * 55)
+    
+    # Overall pre-unlock and post-unlock
+    # SHORT strategy: flip sign of excess returns (negative excess = positive P&L)
+    print("\n  OVERALL (all events):")
+    pre_returns = pd.concat([df[f"excess_pre_return_{d}"] for d in range(-7, 0)])
+    sharpe_pre, sortino_pre = calculate_sharpe_sortino(-pre_returns)
+    post_returns = pd.concat([df[f"excess_return_{d}"] for d in range(8)])
+    sharpe_post, sortino_post = calculate_sharpe_sortino(-post_returns)
+    
+    if sharpe_pre is not None and sortino_pre is not None:
+        print(f"    Pre-Unlock  (-7 to -1):  Sharpe={sharpe_pre:+.4f}  Sortino={sortino_pre:+.4f}")
+    else:
+        print(f"    Pre-Unlock  (-7 to -1):  Sharpe=N/A         Sortino=N/A")
+    
+    if sharpe_post is not None and sortino_post is not None:
+        print(f"    Post-Unlock ( 0 to +7):  Sharpe={sharpe_post:+.4f}  Sortino={sortino_post:+.4f}")
+    else:
+        print(f"    Post-Unlock ( 0 to +7):  Sharpe=N/A         Sortino=N/A")
+    
+    # By category
+    print("\n  BY CATEGORY:")
+    for cat in ["VC", "OTC"]:
+        cat_df = df[df["category"] == cat]
+        if len(cat_df) > 0:
+            pre_cat = pd.concat([cat_df[f"excess_pre_return_{d}"] for d in range(-7, 0)])
+            sharpe_c_pre, sortino_c_pre = calculate_sharpe_sortino(-pre_cat)
+            post_cat = pd.concat([cat_df[f"excess_return_{d}"] for d in range(8)])
+            sharpe_c_post, sortino_c_post = calculate_sharpe_sortino(-post_cat)
+            
+            pre_str = f"Sharpe={sharpe_c_pre:+.4f}  Sortino={sortino_c_pre:+.4f}" if sharpe_c_pre is not None else "N/A"
+            post_str = f"Sharpe={sharpe_c_post:+.4f}  Sortino={sortino_c_post:+.4f}" if sharpe_c_post is not None else "N/A"
+            print(f"    {cat}   Pre: {pre_str}")
+            print(f"         Post: {post_str}")
+    
+    # By bucket (unlock size)
+    print("\n  BY UNLOCK SIZE BUCKET:")
+    for bucket_label in ["Small <5%", "Mid 5-10%", "Large 10-20%", "XL >20%"]:
+        bucket_df = df[df["size_bucket"] == bucket_label]
+        if len(bucket_df) > 0:
+            pre_buck = pd.concat([bucket_df[f"excess_pre_return_{d}"] for d in range(-7, 0)])
+            sharpe_b_pre, sortino_b_pre = calculate_sharpe_sortino(-pre_buck)
+            post_buck = pd.concat([bucket_df[f"excess_return_{d}"] for d in range(8)])
+            sharpe_b_post, sortino_b_post = calculate_sharpe_sortino(-post_buck)
+            
+            pre_str = f"Sharpe={sharpe_b_pre:+.4f}  Sortino={sortino_b_pre:+.4f}" if (sharpe_b_pre is not None and sortino_b_pre is not None) else "N/A"
+            post_str = f"Sharpe={sharpe_b_post:+.4f}  Sortino={sortino_b_post:+.4f}" if (sharpe_b_post is not None and sortino_b_post is not None) else "N/A"
+            print(f"    {bucket_label:15} Pre: {pre_str}")
+            print(f"    {'':15} Post: {post_str}")
+
+    # 8. Analysis by Year
+    print("\n\n[8] Analysis by Year")
+    print("-" * 56)
+
+    # attach year column
+    df["year"] = pd.to_datetime(df["unlock_date"]).dt.year
+
+    years = sorted(df["year"].dropna().unique())
+    for yr in years:
+        year_df = df[df["year"] == yr]
+        n = len(year_df)
+        print(f"\n  ── {yr} (n={n}) ──")
+
+        # cumulative pre / post
+        pre7_avg_y = year_df["pre7_excess_return"].mean()
+        post7_avg_y = year_df["excess_return_7"].mean()
+        pre7_bps_y = year_df.get("pre7_bps_per_day").mean()
+        post7_bps_y = year_df.get("bps_per_day_7").mean()
+
+        # Sharpe/Sortino (SHORT strategy: flip sign)
+        pre_returns_y = pd.concat([year_df[f"excess_pre_return_{d}"] for d in range(-7, 0)])
+        post_returns_y = pd.concat([year_df[f"excess_return_{d}"] for d in range(8)])
+
+        sharpe_pre_y = sortino_pre_y = None
+        sharpe_post_y = sortino_post_y = None
+
+        if pre_returns_y.dropna().size >= 2:
+            sharpe_pre_y, sortino_pre_y = calculate_sharpe_sortino(-pre_returns_y)
+
+        if post_returns_y.dropna().size >= 2:
+            sharpe_post_y, sortino_post_y = calculate_sharpe_sortino(-post_returns_y)
+
+        # Print cumulative + risk-adjusted (guard on both Sharpe and Sortino)
+        if not (sharpe_pre_y is not None and sortino_pre_y is not None):
+            print("  [WARN] Insufficient data for Sharpe/Sortino (n<2)")
+            print(f"  Pre-unlock  (-7 to -1):  {pre7_avg_y*100:+.2f}%  ({pre7_bps_y:+.1f} bps/d)")
+        else:
+            print(f"  Pre-unlock  (-7 to -1):  {pre7_avg_y*100:+.2f}%  ({pre7_bps_y:+.1f} bps/d)  "
+                  f"Sharpe={sharpe_pre_y:+.2f}  Sortino={sortino_pre_y:+.2f}")
+
+        if not (sharpe_post_y is not None and sortino_post_y is not None):
+            print(f"  Post-unlock ( 0 to +7):  {post7_avg_y*100:+.2f}%  ({post7_bps_y:+.1f} bps/d)")
+            print("  [WARN] Insufficient data for Sharpe/Sortino (n<2)")
+        else:
+            print(f"  Post-unlock ( 0 to +7):  {post7_avg_y*100:+.2f}%  ({post7_bps_y:+.1f} bps/d)  "
+                  f"Sharpe={sharpe_post_y:+.2f}  Sortino={sortino_post_y:+.2f}")
+
+        # Daily profile
+        print("\n  Daily profile (bps/day):")
+        for d in range(-7, 8):
+            if d < 0:
+                col = f"bps_per_day_pre_{d}"
+            else:
+                col = f"bps_per_day_{d}"
+            avgd = year_df[col].mean()
+            if d == -1:
+                print("    -------- unlock --------")
+            print(f"    Day {d:>3}:  {avgd:+.1f}")
+
 
 # ============================================================
 # MAIN
@@ -521,9 +673,9 @@ if __name__ == "__main__":
 
     df, price_cache = build_pivot_table(UNLOCK_EVENTS)
 
-    os.makedirs("Jeff", exist_ok=True)
-    df.to_csv("Jeff/unlock_alpha.csv", index=False)
-    print("\nSaved: Jeff/unlock_alpha.csv")
+    os.makedirs("Results", exist_ok=True)
+    df.to_csv("Results/unlock_alpha.csv", index=False)
+    print("\nSaved: Results/unlock_alpha.csv")
 
     print_analysis(df)
 
@@ -570,7 +722,7 @@ if __name__ == "__main__":
     
     if raw_prices:
         raw_df = pd.DataFrame(raw_prices)
-        raw_df.to_csv("Jeff/unlock_raw_prices.csv", index=False)
-        print("Saved: Jeff/unlock_raw_prices.csv")
+        raw_df.to_csv("Results/unlock_raw_prices.csv", index=False)
+        print("Saved: Results/unlock_raw_prices.csv")
 
     print("\nDone.")
