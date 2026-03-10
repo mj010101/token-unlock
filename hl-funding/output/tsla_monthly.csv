@@ -1,0 +1,2 @@
+date,spot_close,perp_close,basis_bps,funding_bps_sum,ann_funding_bps,ann_basis_bps,ann_total_bps
+2025-12-31,485.55999755859375,485.58,0.4119458255788532,80.736438,1964.586658,-105.05897248053003,1859.52768551947
